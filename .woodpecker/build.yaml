@@ -1,0 +1,70 @@
+# Build, publish, and deploy ocr (home-dev, namespace `ocr`).
+#
+# The Dockerfile is multi-stage (golang build stage -> debian-slim + tesseract), so CI does not
+# pre-compile: the image build compiles the binary, and the separate `test` step is what gates it.
+# Same contract as rooter/bench-chroma-rush - lint gate in `.woodpecker/lint.yaml`, then tests, then
+# publish, then stamp the sha into home-ops so Argo rolls the Deployment.
+#
+# Builds are pinned to beefcake-ci-2's dockerd so this repo's layers (the tesseract apt install, the
+# go build cache) stay warm on one node; the other CI nodes are used by other repos.
+#
+# Tags: `:$CI_COMMIT_SHA` (what the manifest pins, immutable) and `:latest` (convenience).
+# `./validate.sh` is the manual end-to-end check against the live service; it is not part of CI
+# because it needs the bearer-token gate credential.
+steps:
+  - name: test
+    image: docker.io/library/golang:1.26
+    commands:
+      - go version
+      - go mod download
+      - test -z "$(gofmt -l .)" || { gofmt -l .; echo "FATAL gofmt - commit the output of gofmt -w ."; exit 1; }
+      - go vet ./...
+      - go test -v -count=1 ./...
+
+  - name: build-and-push
+    image: docker.io/library/docker:cli
+    privileged: true
+    depends_on: [test]
+    environment:
+      DOCKER_HOST: tcp://docker-beefcake-ci-2:2375
+      IMAGE: docker.io/initialed85/ocr
+    backend_options:
+      kubernetes:
+        secrets:
+          - name: dockerhub
+            key: username
+            target:
+              env: DOCKERHUB_USER
+          - name: dockerhub
+            key: token
+            target:
+              env: DOCKERHUB_TOKEN
+    commands:
+      - docker info --format 'daemon={{.Name}}'
+      - echo "$DOCKERHUB_TOKEN" | docker login --username "$DOCKERHUB_USER" --password-stdin
+      - docker build --pull --progress=plain --platform=linux/amd64 -t "$IMAGE:$CI_COMMIT_SHA" -t "$IMAGE:latest" .
+      - docker push "$IMAGE:$CI_COMMIT_SHA"
+      - docker push "$IMAGE:latest"
+      - docker inspect --format 'digests={{.RepoDigests}}' "$IMAGE:$CI_COMMIT_SHA"
+
+  - name: deploy-home-ops
+    image: docker.io/initialed85/wp-kustomize-deploy:latest
+    depends_on: [build-and-push]
+    settings:
+      image: docker.io/initialed85/ocr
+      dir: clusters/dev/applications/ocr
+    backend_options:
+      kubernetes:
+        secrets:
+          - name: home-ops-deploy-key
+            key: id_ed25519
+            target:
+              env: PLUGIN_DEPLOY_KEY
+          - name: home-ops-deploy-key
+            key: known_hosts
+            target:
+              env: PLUGIN_KNOWN_HOSTS
+
+when:
+  - event: push
+    branch: master
