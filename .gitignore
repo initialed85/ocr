@@ -1,0 +1,4 @@
+# Local harness state written by the agent pod. Never commit these: they hold
+# schedules, resume config, image uploads and full session transcripts.
+.pi/
+.slopyphus/
